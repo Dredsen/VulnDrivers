@@ -774,6 +774,8 @@ class DriverScannerApp:
 
         results_lock  = threading.Lock()
         analyse_done  = [0]
+        seen_sha256   = set()
+        dedup_count   = [0]
 
         # Capture filter state once so background threads don't touch tkinter vars
         signed_only   = self.signed_only.get()
@@ -790,10 +792,17 @@ class DriverScannerApp:
             path, src = job
             r = analyze_driver(path, source_archive=src)
             with results_lock:
-                idx = len(self.all_results)
-                self.all_results.append(r)
                 analyse_done[0] += 1
                 d = analyse_done[0]
+                sha = r["sha256"]
+                if sha and sha in seen_sha256:
+                    dedup_count[0] += 1
+                    self.root.after(0, lambda: self.progress.step(1))
+                    return
+                if sha:
+                    seen_sha256.add(sha)
+                idx = len(self.all_results)
+                self.all_results.append(r)
             self.root.after(0, lambda: self.progress.step(1))
             if d % update_every == 0 or d == total:
                 self.root.after(0, lambda d=d, t=total:
@@ -819,9 +828,9 @@ class DriverScannerApp:
                 "error": f"Extraction failed: {err}",
             })
 
-        self.root.after(0, lambda: self._finish_scan(len(sys_files), len(archives)))
+        self.root.after(0, lambda: self._finish_scan(len(sys_files), len(archives), dedup_count[0]))
 
-    def _finish_scan(self, direct_count, archive_count):
+    def _finish_scan(self, direct_count, archive_count, dedup_count=0):
         self._stop_elapsed_ticker()
         self.progress.stop()
         results   = self.all_results
@@ -835,10 +844,11 @@ class DriverScannerApp:
         errors    = sum(1 for r in results if r["error"])
         shown     = len(self.tree.get_children())
 
+        dedup_str = f"  Dupes skipped: {dedup_count}" if dedup_count else ""
         self.status_var.set(
-            f"Done — {shown} shown / {len(results)} scanned  |  "
+            f"Done — {shown} shown / {len(results)} unique  |  "
             f"Signed: {signed} ({embedded} emb / {catalog} cat)  "
-            f"Dangerous: {danger}  🎯 Priority: {high}"
+            f"Dangerous: {danger}  🎯 Priority: {high}{dedup_str}"
         )
         self.count_label.config(text=f"{shown} result(s)")
 
@@ -846,7 +856,8 @@ class DriverScannerApp:
             f"Direct .sys    {direct_count}",
             f"Archives       {archive_count}",
             f"From archives  {from_arch}",
-            f"Total results  {len(results)}",
+            f"Dupes skipped  {dedup_count}",
+            f"Unique results {len(results)}",
             f"Shown          {shown}",
             f"───────────────────────",
             f"Embedded ✓     {embedded}",
