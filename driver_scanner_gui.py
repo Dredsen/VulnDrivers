@@ -540,9 +540,6 @@ class DriverScannerApp:
             self._start_scan(folder)
 
     def _on_drag_init(self, event):
-        iid = self.tree.identify_row(event.y)
-        if iid:
-            self.tree.selection_set(iid)
         _, r = self._selected_result()
         if r is None:
             return ("refuse", DND_FILES, "")
@@ -550,8 +547,8 @@ class DriverScannerApp:
         if not src.exists():
             self.status_var.set(f"Cannot drag: file not found — {src.name}")
             return ("refuse", DND_FILES, "")
-        # Wrap path in braces if it contains spaces (Windows DND_FILES convention)
-        path_str = f"{{{src}}}" if " " in str(src) else str(src)
+        files = [src] + list(src.parent.glob("*.cat"))
+        path_str = " ".join("{" + str(p) + "}" for p in files)
         return ("copy", DND_FILES, path_str)
 
     def _on_drop(self, event):
@@ -592,15 +589,17 @@ class DriverScannerApp:
                 "It may have been in a temp folder that was cleared.\n\n"
                 f"{src}")
             return
-        dest = filedialog.asksaveasfilename(
-            defaultextension=".sys",
-            initialfile=r["filename"],
-            filetypes=[("Driver files", "*.sys"), ("All files", "*.*")],
-            title="Save driver to…",
-        )
-        if dest:
-            shutil.copy2(str(src), dest)
-            self.status_var.set(f"Driver saved to {dest}")
+        dest_dir = filedialog.askdirectory(title="Extract driver to folder…")
+        if not dest_dir:
+            return
+        dest_dir = Path(dest_dir)
+        copied = []
+        shutil.copy2(str(src), dest_dir / src.name)
+        copied.append(src.name)
+        for cat in src.parent.glob("*.cat"):
+            shutil.copy2(str(cat), dest_dir / cat.name)
+            copied.append(cat.name)
+        self.status_var.set(f"Extracted to {dest_dir}: {', '.join(copied)}")
 
     def _ctx_open_folder(self):
         _, r = self._selected_result()
