@@ -91,33 +91,56 @@ def find_7zip():
             return candidate
     return None
 
+def _7z_contains_sys(archive_path, seven_zip):
+    """Return True if the archive listing contains at least one .sys entry."""
+    try:
+        result = subprocess.run(
+            [seven_zip, "l", str(archive_path)],
+            capture_output=True, timeout=30,
+        )
+        return b".sys" in result.stdout.lower()
+    except Exception:
+        return True  # assume yes on error — better to over-extract than skip
+
 def extract_archive(archive_path, dest_dir, seven_zip=None):
     """
-    Extract archive_path into dest_dir.
-    Returns a list of .sys Paths found inside, plus an error string (empty on success).
+    Extract only .sys files from archive_path into dest_dir.
+    Returns (list[Path], error_str).
     """
     suffix = archive_path.suffix.lower()
     error  = ""
     try:
         if suffix == ".zip":
             with zipfile.ZipFile(archive_path) as zf:
-                zf.extractall(dest_dir)
+                members = [m for m in zf.namelist() if m.lower().endswith(".sys")]
+                if not members:
+                    return [], ""
+                for member in members:
+                    zf.extract(member, dest_dir)
+
         elif suffix == ".cab":
             result = subprocess.run(
-                ["expand.exe", str(archive_path), "-F:*", str(dest_dir)],
+                ["expand.exe", str(archive_path), "-F:*.sys", str(dest_dir)],
                 capture_output=True, timeout=60,
             )
-            if result.returncode not in (0, 1):  # expand returns 1 on partial success
+            if result.returncode not in (0, 1):
                 error = result.stderr.decode(errors="ignore").strip() or f"expand exit {result.returncode}"
+
         elif seven_zip:
+            # Quick listing pass — skip archive entirely if no .sys present
+            if not _7z_contains_sys(archive_path, seven_zip):
+                return [], ""
             result = subprocess.run(
-                [seven_zip, "x", str(archive_path), f"-o{dest_dir}", "-y", "-r"],
+                [seven_zip, "x", str(archive_path), f"-o{dest_dir}",
+                 "-y", "-r", "*.sys", "-mmt=on"],
                 capture_output=True, timeout=120,
             )
             if result.returncode not in (0, 1):
                 error = result.stderr.decode(errors="ignore").strip() or f"7z exit {result.returncode}"
+
         else:
             error = f"No extractor for {suffix} (install 7-Zip)"
+
     except Exception as e:
         error = str(e)
 
