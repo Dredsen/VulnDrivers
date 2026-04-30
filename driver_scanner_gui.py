@@ -54,10 +54,22 @@ TEXT      = "#c8d0e0"
 TEXT_DIM  = "#5a6070"
 
 DANGEROUS_IMPORTS = [
-    "MmMapIoSpace", "MmGetPhysicalAddress", "MmAllocateContiguousMemory",
-    "ZwMapViewOfSection", "HalTranslateBusAddress", "ZwOpenSection",
+    # Physical memory access
+    "MmMapIoSpace", "MmMapIoSpaceEx",
+    "MmGetPhysicalAddress", "MmCopyMemory",
+    "MmAllocateContiguousMemory", "MmAllocateContiguousMemorySpecifyCache",
+    # Section/view mapping
+    "ZwMapViewOfSection", "ZwOpenSection",
+    # Bus / hardware access
+    "HalTranslateBusAddress", "HalGetBusDataByOffset", "HalSetBusDataByOffset",
+    # Port I/O — 8, 16 and 32-bit variants
+    "READ_PORT_UCHAR",  "WRITE_PORT_UCHAR",
+    "READ_PORT_USHORT", "WRITE_PORT_USHORT",
+    "READ_PORT_ULONG",  "WRITE_PORT_ULONG",
+    # Kernel object / SSDT manipulation
     "ObReferenceObjectByName", "KeServiceDescriptorTable",
-    "READ_PORT_UCHAR", "WRITE_PORT_UCHAR", "READ_PORT_ULONG", "WRITE_PORT_ULONG",
+    # Driver loading and debug control (highest severity)
+    "ZwLoadDriver", "ZwSystemDebugControl",
 ]
 
 ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar"}
