@@ -2,9 +2,12 @@
 """
 Driver Scanner GUI — LOLDrivers Research Tool
 Drag a folder onto the window or click Browse to scan recursively for .sys files.
+Also extracts and scans .zip, .cab, .exe, .msi, .7z, .rar archives.
 
 Requirements:
     pip install pefile tkinterdnd2
+Optional (for exe/msi/7z/rar extraction):
+    7-Zip installed (https://7-zip.org) — auto-detected from PATH or default install locations.
 """
 
 import os
@@ -13,8 +16,11 @@ import sys
 import json
 import time
 import uuid
+import shutil
 import hashlib
+import zipfile
 import threading
+import subprocess
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -24,11 +30,10 @@ from datetime import datetime, timezone
 try:
     import pefile
 except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pefile", "--break-system-packages"])
+    import subprocess as _sp
+    _sp.check_call([sys.executable, "-m", "pip", "install", "pefile", "--break-system-packages"])
     import pefile
 
-# Optional drag-and-drop support
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     DND_AVAILABLE = True
@@ -46,9 +51,6 @@ GOLD      = "#ffd166"
 GREEN     = "#06d6a0"
 TEXT      = "#c8d0e0"
 TEXT_DIM  = "#5a6070"
-FONT_MONO = ("Courier New", 10)
-FONT_UI   = ("Courier New", 11)
-FONT_HEAD = ("Courier New", 14, "bold")
 
 DANGEROUS_IMPORTS = [
     "MmMapIoSpace", "MmGetPhysicalAddress", "MmAllocateContiguousMemory",
@@ -57,7 +59,57 @@ DANGEROUS_IMPORTS = [
     "READ_PORT_UCHAR", "WRITE_PORT_UCHAR", "READ_PORT_ULONG", "WRITE_PORT_ULONG",
 ]
 
+ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar"}
+
 LOLDRIVERS_API_URL = "https://www.loldrivers.io/api/drivers.json"
+
+# ── Archive helpers ────────────────────────────────────────────────────────────
+
+def find_7zip():
+    """Return path to 7z.exe or None."""
+    found = shutil.which("7z") or shutil.which("7za")
+    if found:
+        return found
+    for candidate in [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+def extract_archive(archive_path, dest_dir, seven_zip=None):
+    """
+    Extract archive_path into dest_dir.
+    Returns a list of .sys Paths found inside, plus an error string (empty on success).
+    """
+    suffix = archive_path.suffix.lower()
+    error  = ""
+    try:
+        if suffix == ".zip":
+            with zipfile.ZipFile(archive_path) as zf:
+                zf.extractall(dest_dir)
+        elif suffix == ".cab":
+            result = subprocess.run(
+                ["expand.exe", str(archive_path), "-F:*", str(dest_dir)],
+                capture_output=True, timeout=60,
+            )
+            if result.returncode not in (0, 1):  # expand returns 1 on partial success
+                error = result.stderr.decode(errors="ignore").strip() or f"expand exit {result.returncode}"
+        elif seven_zip:
+            result = subprocess.run(
+                [seven_zip, "x", str(archive_path), f"-o{dest_dir}", "-y", "-r"],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode not in (0, 1):
+                error = result.stderr.decode(errors="ignore").strip() or f"7z exit {result.returncode}"
+        else:
+            error = f"No extractor for {suffix} (install 7-Zip)"
+    except Exception as e:
+        error = str(e)
+
+    sys_files = sorted(Path(dest_dir).rglob("*.sys")) if not error else []
+    return sys_files, error
 
 # ── Analysis logic ─────────────────────────────────────────────────────────────
 
@@ -98,7 +150,7 @@ def extract_ascii_strings(data, min_len=5):
         result.append("".join(current))
     return result
 
-def analyze_driver(path):
+def analyze_driver(path, source_archive=""):
     r = {
         "path": str(path), "filename": path.name,
         "size_bytes": path.stat().st_size,
@@ -107,7 +159,8 @@ def analyze_driver(path):
         "architecture": "", "dangerous_imports": [],
         "device_names": [], "symlinks": [],
         "pdb_path": "", "company": "", "description": "",
-        "original_filename": "", "error": "",
+        "original_filename": "", "source_archive": source_archive,
+        "error": "",
     }
     try:
         r["md5"], r["sha1"], r["sha256"] = hash_file(path)
@@ -138,22 +191,20 @@ def analyze_driver(path):
                             for k, v in st.entries.items():
                                 key = k.decode(errors="ignore").strip()
                                 val = v.decode(errors="ignore").strip()
-                                if key == "CompanyName": r["company"] = val
+                                if key == "CompanyName":      r["company"] = val
                                 elif key == "FileDescription": r["description"] = val
                                 elif key == "OriginalFilename": r["original_filename"] = val
         ascii_strs = extract_ascii_strings(raw)
         for s in ascii_strs:
             if ".pdb" in s.lower():
                 r["pdb_path"] = s; break
-        # Check ASCII strings for device names and symlinks (often stored as plain ASCII)
-        seen_devs = set(r["device_names"])
-        seen_syms = set(r["symlinks"])
+        seen_devs = set()
+        seen_syms = set()
         for s in ascii_strs:
             if "\\Device\\" in s and s not in seen_devs:
                 r["device_names"].append(s); seen_devs.add(s)
             elif ("\\DosDevices\\" in s or "\\??\\" in s) and s not in seen_syms:
                 r["symlinks"].append(s); seen_syms.add(s)
-        # Check unicode strings for device names and symlinks
         for s in extract_unicode_strings(raw):
             if "\\Device\\" in s and s not in seen_devs:
                 r["device_names"].append(s); seen_devs.add(s)
@@ -174,20 +225,20 @@ class DriverScannerApp:
         self.root.geometry("1100x750")
         self.root.minsize(900, 600)
 
-        self.all_results = []   # full scan output — never filtered
-        self.scan_thread = None
-        self.signed_only   = tk.BooleanVar(value=False)
+        self.all_results  = []
+        self._temp_dirs   = []   # cleaned up on Clear or window close
+        self.scan_thread  = None
+        self.signed_only    = tk.BooleanVar(value=False)
         self.dangerous_only = tk.BooleanVar(value=False)
 
-        # LOLDrivers cache: {hash_lower: driver_uuid}
         self._lold_cache    = None
         self._lold_cache_ts = 0.0
 
         self._build_ui()
 
-        # Re-render table instantly when filters change
         self.signed_only.trace_add("write", self._apply_filters)
         self.dangerous_only.trace_add("write", self._apply_filters)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if DND_AVAILABLE:
             self.drop_zone.drop_target_register(DND_FILES)
@@ -196,36 +247,26 @@ class DriverScannerApp:
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Header
         header = tk.Frame(self.root, bg=BG, pady=14)
         header.pack(fill="x", padx=20)
-
         tk.Label(header, text="[ DRIVER SCANNER ]", font=("Courier New", 18, "bold"),
                  fg=ACCENT, bg=BG).pack(side="left")
         tk.Label(header, text="LOLDrivers Research Tool", font=("Courier New", 10),
                  fg=TEXT_DIM, bg=BG).pack(side="left", padx=12, pady=4)
-
-        # Thin accent line
         tk.Frame(self.root, bg=ACCENT, height=1).pack(fill="x", padx=20)
 
-        # Main body
         body = tk.Frame(self.root, bg=BG)
         body.pack(fill="both", expand=True, padx=20, pady=12)
 
-        # Left panel
         left = tk.Frame(body, bg=BG, width=280)
         left.pack(side="left", fill="y", padx=(0, 14))
         left.pack_propagate(False)
-
         self._build_left(left)
 
-        # Right panel
         right = tk.Frame(body, bg=BG)
         right.pack(side="left", fill="both", expand=True)
-
         self._build_right(right)
 
-        # Status bar
         self.status_var = tk.StringVar(value="Ready. Drop a folder or click Browse.")
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
         status_bar = tk.Frame(self.root, bg=BG2, pady=6)
@@ -236,65 +277,52 @@ class DriverScannerApp:
         self.progress.pack(side="right", padx=14)
 
     def _build_left(self, parent):
-        # Drop zone
         drop_frame = tk.Frame(parent, bg=BG3, bd=0, highlightthickness=2,
                               highlightbackground=BORDER)
         drop_frame.pack(fill="x", pady=(0, 12))
-
         self.drop_zone = tk.Label(
-            drop_frame,
-            text="⬇  DROP FOLDER HERE",
+            drop_frame, text="⬇  DROP FOLDER HERE",
             font=("Courier New", 11, "bold"),
             fg=ACCENT if DND_AVAILABLE else TEXT_DIM,
             bg=BG3, pady=28, cursor="hand2" if DND_AVAILABLE else "arrow",
         )
         self.drop_zone.pack(fill="x")
-
         if not DND_AVAILABLE:
             tk.Label(drop_frame, text="(install tkinterdnd2 to enable)", font=("Courier New", 8),
                      fg=TEXT_DIM, bg=BG3).pack(pady=(0, 8))
 
-        # Browse button
         self._btn(parent, "📂  BROWSE FOLDER", self._browse, ACCENT).pack(fill="x", pady=(0, 8))
 
-        # Filters
         filt = tk.LabelFrame(parent, text=" FILTERS ", font=("Courier New", 9, "bold"),
                              fg=TEXT_DIM, bg=BG, bd=1, highlightthickness=0,
                              relief="flat", highlightbackground=BORDER)
         filt.pack(fill="x", pady=(4, 12))
-
         self._check(filt, "Signed only  (recommended)", self.signed_only)
         self._check(filt, "Dangerous imports only", self.dangerous_only)
 
-        # Export / actions
         self._btn(parent, "💾  EXPORT CSV",       self._export_csv,       GOLD   ).pack(fill="x", pady=(0, 8))
         self._btn(parent, "📋  EXPORT YAML",      self._export_yaml,      ACCENT ).pack(fill="x", pady=(0, 8))
         self._btn(parent, "🔍  CHECK LOLDRIVERS", self._check_loldrivers, GREEN  ).pack(fill="x", pady=(0, 8))
         self._btn(parent, "🗑  CLEAR RESULTS",    self._clear,            ACCENT2).pack(fill="x")
 
-        # Summary box
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", pady=12)
         tk.Label(parent, text="SUMMARY", font=("Courier New", 9, "bold"),
                  fg=TEXT_DIM, bg=BG).pack(anchor="w")
-
         self.summary_text = tk.Text(parent, bg=BG2, fg=TEXT, font=("Courier New", 9),
-                                    bd=0, relief="flat", height=10, state="disabled",
+                                    bd=0, relief="flat", height=12, state="disabled",
                                     highlightthickness=1, highlightbackground=BORDER)
         self.summary_text.pack(fill="both", expand=True, pady=(6, 0))
 
     def _build_right(self, parent):
-        # Toolbar
         toolbar = tk.Frame(parent, bg=BG)
         toolbar.pack(fill="x", pady=(0, 8))
         tk.Label(toolbar, text="RESULTS", font=("Courier New", 10, "bold"),
                  fg=TEXT_DIM, bg=BG).pack(side="left")
-
         self.count_label = tk.Label(toolbar, text="", font=("Courier New", 9),
                                     fg=ACCENT, bg=BG)
         self.count_label.pack(side="left", padx=10)
 
-        # Table
-        cols = ("priority", "filename", "arch", "signed", "danger", "company", "compiled", "sha256")
+        cols       = ("priority", "filename", "arch", "signed", "danger", "company", "compiled", "sha256")
         col_labels = ("!", "Filename", "Arch", "Signed", "Dangerous Imports", "Company", "Compiled", "SHA256")
         col_widths = (28, 170, 55, 70, 200, 140, 90, 260)
 
@@ -317,11 +345,8 @@ class DriverScannerApp:
 
         self.tree = ttk.Treeview(frame, columns=cols, show="headings",
                                  selectmode="browse", style="Treeview")
-
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview,
-                            style="Vertical.TScrollbar")
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview,
-                            style="Vertical.TScrollbar")
+        vsb = ttk.Scrollbar(frame, orient="vertical",   command=self.tree.yview, style="Vertical.TScrollbar")
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview, style="Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         for col, label, width in zip(cols, col_labels, col_widths):
@@ -340,31 +365,39 @@ class DriverScannerApp:
         frame.grid_columnconfigure(0, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        # Right-click context menu
+        self.ctx_menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=TEXT,
+                                activebackground=BG3, activeforeground=ACCENT,
+                                font=("Courier New", 9), bd=0, relief="flat")
+        self.ctx_menu.add_command(label="📋  Copy SHA256",             command=self._ctx_copy_sha256)
+        self.ctx_menu.add_command(label="💾  Extract driver to…",      command=self._ctx_extract)
+        self.ctx_menu.add_command(label="📂  Open containing folder",  command=self._ctx_open_folder)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_command(label="📋  Export YAML",             command=self._export_yaml)
+        self.ctx_menu.add_command(label="🔍  Check LOLDrivers",        command=self._check_loldrivers)
 
         # Detail panel
-        detail_frame = tk.Frame(parent, bg=BG2, highlightthickness=1,
-                                highlightbackground=BORDER)
+        detail_frame = tk.Frame(parent, bg=BG2, highlightthickness=1, highlightbackground=BORDER)
         detail_frame.pack(fill="x", pady=(10, 0))
-
         tk.Label(detail_frame, text="DETAILS", font=("Courier New", 9, "bold"),
                  fg=TEXT_DIM, bg=BG2, pady=4, padx=8).pack(anchor="w")
-
         self.detail_text = tk.Text(detail_frame, bg=BG2, fg=TEXT, font=("Courier New", 9),
-                                   bd=0, relief="flat", height=7,
+                                   bd=0, relief="flat", height=8,
                                    highlightthickness=0, state="disabled", wrap="none")
-        det_scroll = ttk.Scrollbar(detail_frame, orient="vertical",
-                                   command=self.detail_text.yview)
+        det_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail_text.yview)
         self.detail_text.configure(yscrollcommand=det_scroll.set)
         self.detail_text.pack(side="left", fill="both", expand=True, padx=8, pady=(0, 8))
         det_scroll.pack(side="right", fill="y", pady=(0, 8))
 
-        # Tag colours for detail panel
         self.detail_text.tag_configure("key",        foreground=ACCENT)
         self.detail_text.tag_configure("value",      foreground=TEXT)
         self.detail_text.tag_configure("danger",     foreground=ACCENT2, font=("Courier New", 9, "bold"))
         self.detail_text.tag_configure("signed",     foreground=GREEN)
         self.detail_text.tag_configure("hash",       foreground=TEXT_DIM)
-        self.detail_text.tag_configure("gold",       foreground=GOLD, font=("Courier New", 9, "bold"))
+        self.detail_text.tag_configure("gold",       foreground=GOLD,    font=("Courier New", 9, "bold"))
+        self.detail_text.tag_configure("archive",    foreground=GOLD)
         self.detail_text.tag_configure("lold_known", foreground=ACCENT2, font=("Courier New", 9, "bold"))
         self.detail_text.tag_configure("lold_clean", foreground=GREEN,   font=("Courier New", 9, "bold"))
 
@@ -385,11 +418,10 @@ class DriverScannerApp:
                        selectcolor=BG3, font=("Courier New", 9), bd=0).pack(anchor="w", padx=8, pady=3)
 
     def _selected_result(self):
-        """Return (idx, result) for the currently selected tree row, or (None, None)."""
         sel = self.tree.selection()
         if not sel:
             return None, None
-        idx = int(sel[0][1:])  # iid is "r<index>"
+        idx = int(sel[0][1:])
         if idx < len(self.all_results):
             return idx, self.all_results[idx]
         return None, None
@@ -413,6 +445,55 @@ class DriverScannerApp:
         if r:
             self._show_detail(r)
 
+    def _on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self.ctx_menu.post(event.x_root, event.y_root)
+
+    # ── Right-click actions ────────────────────────────────────────────────────
+
+    def _ctx_copy_sha256(self):
+        _, r = self._selected_result()
+        if r:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(r["sha256"])
+            self.status_var.set(f"SHA256 copied: {r['sha256'][:20]}…")
+
+    def _ctx_extract(self):
+        _, r = self._selected_result()
+        if r is None:
+            return
+        src = Path(r["path"])
+        if not src.exists():
+            messagebox.showerror("File not found",
+                "The driver file is no longer accessible.\n"
+                "It may have been in a temp folder that was cleared.\n\n"
+                f"{src}")
+            return
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".sys",
+            initialfile=r["filename"],
+            filetypes=[("Driver files", "*.sys"), ("All files", "*.*")],
+            title="Save driver to…",
+        )
+        if dest:
+            shutil.copy2(str(src), dest)
+            self.status_var.set(f"Driver saved to {dest}")
+
+    def _ctx_open_folder(self):
+        _, r = self._selected_result()
+        if r is None:
+            return
+        folder = Path(r["path"]).parent
+        if folder.exists():
+            os.startfile(str(folder))
+        else:
+            messagebox.showwarning("Folder not found",
+                "The containing folder no longer exists.\n"
+                "Temp folders from archive extraction are cleared when you click Clear.\n\n"
+                f"{folder}")
+
     # ── Filtering ──────────────────────────────────────────────────────────────
 
     def _passes_filter(self, r):
@@ -423,7 +504,6 @@ class DriverScannerApp:
         return True
 
     def _apply_filters(self, *_):
-        """Rebuild the tree from all_results using the current filter state."""
         for item in self.tree.get_children():
             self.tree.delete(item)
         for idx, r in enumerate(self.all_results):
@@ -444,65 +524,125 @@ class DriverScannerApp:
 
     def _scan_worker(self, folder):
         root = Path(folder)
-        sys_files = sorted(root.rglob("*.sys"))
 
-        if not sys_files:
-            self.root.after(0, lambda: self.status_var.set("No .sys files found."))
+        # Collect direct .sys files (excluding anything inside our own temp dirs)
+        own_temp = {str(t) for t in self._temp_dirs}
+        sys_files = [
+            p for p in sorted(root.rglob("*.sys"))
+            if not any(str(p).startswith(t) for t in own_temp)
+        ]
+
+        # Collect archive files
+        archives = []
+        for ext in ARCHIVE_EXTENSIONS:
+            archives.extend(root.rglob(f"*{ext}"))
+        archives = sorted(set(archives))
+
+        if not sys_files and not archives:
+            self.root.after(0, lambda: self.status_var.set("No .sys files or archives found."))
             self.root.after(0, self.progress.stop)
             return
 
-        total = len(sys_files)
-        self.root.after(0, lambda: self.status_var.set(f"Found {total} driver(s). Analysing..."))
+        self.root.after(0, lambda: self.status_var.set(
+            f"Found {len(sys_files)} driver(s), {len(archives)} archive(s). Analysing…"))
 
+        # ── Direct .sys files ──────────────────────────────────────────────────
         for i, path in enumerate(sys_files, 1):
             r = analyze_driver(path)
             idx = len(self.all_results)
             self.all_results.append(r)
-
             if self._passes_filter(r):
                 self.root.after(0, lambda r=r, idx=idx: self._add_row(r, idx))
+            self.root.after(0, lambda i=i, t=len(sys_files), name=path.name: self.status_var.set(
+                f"Driver {i}/{t}: {name}"))
 
-            self.root.after(0, lambda i=i, t=total, name=path.name: self.status_var.set(
-                f"Analysing {i}/{t}: {name}"))
+        # ── Archives ───────────────────────────────────────────────────────────
+        seven_zip = find_7zip()
+        if archives and not seven_zip:
+            self.root.after(0, lambda: self.status_var.set(
+                "7-Zip not found — .exe/.msi/.7z/.rar skipped. .zip and .cab still work."))
 
-        self.root.after(0, lambda: self._finish_scan(total))
+        for i, archive in enumerate(archives, 1):
+            self.root.after(0, lambda i=i, t=len(archives), name=archive.name: self.status_var.set(
+                f"Extracting archive {i}/{t}: {name}"))
 
-    def _finish_scan(self, total):
+            tmp = root / "_drvscan_extracted" / archive.name
+            tmp.mkdir(parents=True, exist_ok=True)
+            if tmp not in self._temp_dirs:
+                # Register the top-level extracted folder once for cleanup
+                extract_root = root / "_drvscan_extracted"
+                if extract_root not in self._temp_dirs:
+                    self._temp_dirs.append(extract_root)
+
+            extracted_sys, err = extract_archive(archive, tmp, seven_zip)
+
+            if err:
+                # Store a sentinel result so the error is visible in the summary
+                self.all_results.append({
+                    "path": str(archive), "filename": archive.name,
+                    "size_bytes": 0, "md5": "", "sha1": "", "sha256": "",
+                    "signed": False, "compile_timestamp": "", "architecture": "",
+                    "dangerous_imports": [], "device_names": [], "symlinks": [],
+                    "pdb_path": "", "company": "", "description": "",
+                    "original_filename": "", "source_archive": "",
+                    "error": f"Extraction failed: {err}",
+                })
+                continue
+
+            for path in extracted_sys:
+                r = analyze_driver(path, source_archive=str(archive))
+                idx = len(self.all_results)
+                self.all_results.append(r)
+                if self._passes_filter(r):
+                    self.root.after(0, lambda r=r, idx=idx: self._add_row(r, idx))
+
+        self.root.after(0, lambda: self._finish_scan(len(sys_files), len(archives)))
+
+    def _finish_scan(self, direct_count, archive_count):
         self.progress.stop()
-        results = self.all_results
-        signed   = sum(1 for r in results if r["signed"])
-        unsigned = sum(1 for r in results if not r["signed"])
-        danger   = sum(1 for r in results if r["dangerous_imports"])
-        high     = sum(1 for r in results if r["signed"] and r["dangerous_imports"])
-        shown    = len(self.tree.get_children())
+        results   = self.all_results
+        signed    = sum(1 for r in results if r["signed"])
+        unsigned  = sum(1 for r in results if not r["signed"] and not r["error"])
+        danger    = sum(1 for r in results if r["dangerous_imports"])
+        high      = sum(1 for r in results if r["signed"] and r["dangerous_imports"])
+        from_arch = sum(1 for r in results if r.get("source_archive"))
+        errors    = sum(1 for r in results if r["error"])
+        shown     = len(self.tree.get_children())
 
         self.status_var.set(
-            f"Done — {shown} shown / {total} scanned  |  "
-            f"Signed: {signed}  Unsigned: {unsigned}  "
-            f"Dangerous: {danger}  🎯 High priority: {high}"
+            f"Done — {shown} shown / {len(results)} scanned  |  "
+            f"Signed: {signed}  Dangerous: {danger}  🎯 Priority: {high}"
         )
         self.count_label.config(text=f"{shown} result(s)")
 
-        summary = (
-            f"Scanned      {total}\n"
-            f"Shown        {shown}\n"
-            f"─────────────────────\n"
-            f"Signed       {signed}\n"
-            f"Unsigned     {unsigned}\n"
-            f"─────────────────────\n"
-            f"Dangerous    {danger}\n"
-            f"─────────────────────\n"
-            f"🎯 Priority  {high}\n"
-        )
+        lines = [
+            f"Direct .sys    {direct_count}",
+            f"Archives       {archive_count}",
+            f"From archives  {from_arch}",
+            f"Total results  {len(results)}",
+            f"Shown          {shown}",
+            f"───────────────────────",
+            f"Signed         {signed}",
+            f"Unsigned       {unsigned}",
+            f"───────────────────────",
+            f"Dangerous      {danger}",
+            f"───────────────────────",
+            f"🎯 Priority    {high}",
+        ]
+        if errors:
+            lines.append(f"⚠ Errors       {errors}")
+
         self.summary_text.configure(state="normal")
         self.summary_text.delete("1.0", "end")
-        self.summary_text.insert("end", summary)
+        self.summary_text.insert("end", "\n".join(lines))
         self.summary_text.configure(state="disabled")
 
     def _add_row(self, r, idx):
-        signed_str  = "YES ✓" if r["signed"] else "no"
-        danger_str  = ", ".join(r["dangerous_imports"]) if r["dangerous_imports"] else "—"
-        priority    = "🎯" if (r["signed"] and r["dangerous_imports"]) else ""
+        signed_str = "YES ✓" if r["signed"] else "no"
+        danger_str = ", ".join(r["dangerous_imports"]) if r["dangerous_imports"] else "—"
+        priority   = "🎯" if (r["signed"] and r["dangerous_imports"]) else ""
+        # Small marker for archive-extracted drivers
+        filename   = f"[A] {r['filename']}" if r.get("source_archive") else r["filename"]
 
         tag = "normal"
         if r["signed"] and r["dangerous_imports"]: tag = "high"
@@ -510,14 +650,8 @@ class DriverScannerApp:
         elif r["signed"]:                          tag = "signed"
 
         self.tree.insert("", "end", iid=f"r{idx}", tags=(tag,), values=(
-            priority,
-            r["filename"],
-            r["architecture"],
-            signed_str,
-            danger_str,
-            r["company"] or "—",
-            r["compile_timestamp"],
-            r["sha256"],
+            priority, filename, r["architecture"], signed_str,
+            danger_str, r["company"] or "—", r["compile_timestamp"], r["sha256"],
         ))
         self.count_label.config(text=f"{len(self.tree.get_children())} result(s)")
 
@@ -529,19 +663,21 @@ class DriverScannerApp:
             self.detail_text.insert("end", f"  {key:<20}", "key")
             self.detail_text.insert("end", f"{val}\n", tag)
 
-        priority = r["signed"] and bool(r["dangerous_imports"])
-        if priority:
+        if r["signed"] and r["dangerous_imports"]:
             self.detail_text.insert("end", "  🎯 HIGH PRIORITY — Signed + Dangerous Imports\n", "gold")
 
-        kv("File",         r["filename"])
-        kv("Path",         r["path"])
-        kv("Size",         f"{r['size_bytes']:,} bytes")
-        kv("Architecture", r["architecture"])
-        kv("Compiled",     r["compile_timestamp"])
-        kv("Company",      r["company"] or "—")
-        kv("Description",  r["description"] or "—")
-        kv("Original Name",r["original_filename"] or "—")
-        kv("Signed",       "YES" if r["signed"] else "NO",
+        if r.get("source_archive"):
+            self.detail_text.insert("end", f"  📦 Extracted from: {r['source_archive']}\n", "archive")
+
+        kv("File",          r["filename"])
+        kv("Path",          r["path"])
+        kv("Size",          f"{r['size_bytes']:,} bytes")
+        kv("Architecture",  r["architecture"])
+        kv("Compiled",      r["compile_timestamp"])
+        kv("Company",       r["company"] or "—")
+        kv("Description",   r["description"] or "—")
+        kv("Original Name", r["original_filename"] or "—")
+        kv("Signed",        "YES" if r["signed"] else "NO",
            "signed" if r["signed"] else "danger")
 
         if r["dangerous_imports"]:
@@ -551,7 +687,6 @@ class DriverScannerApp:
 
         kv("Device Names", ", ".join(r["device_names"]) or "—")
         kv("Symlinks",     ", ".join(r["symlinks"]) or "—")
-
         if r["pdb_path"]:
             kv("PDB Path", r["pdb_path"])
 
@@ -577,12 +712,11 @@ class DriverScannerApp:
 
     def _lold_check_worker(self, r):
         try:
-            lookup = self._fetch_loldrivers()
-            sha256 = r["sha256"].lower()
-            sha1   = r["sha1"].lower()
-            md5    = r["md5"].lower()
-            match_uuid = lookup.get(sha256) or lookup.get(sha1) or lookup.get(md5)
-            self.root.after(0, lambda: self._show_lold_result(r, match_uuid))
+            lookup    = self._fetch_loldrivers()
+            match_uid = (lookup.get(r["sha256"].lower()) or
+                         lookup.get(r["sha1"].lower()) or
+                         lookup.get(r["md5"].lower()))
+            self.root.after(0, lambda: self._show_lold_result(match_uid))
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f"LOLDrivers check failed: {e}"))
 
@@ -608,9 +742,8 @@ class DriverScannerApp:
         self._lold_cache_ts = now
         return lookup
 
-    def _show_lold_result(self, r, match_uuid):
+    def _show_lold_result(self, match_uuid):
         self.detail_text.configure(state="normal")
-        # Prepend the result line before any existing content
         if match_uuid:
             line = f"  ⚠ KNOWN in LOLDrivers — UUID: {match_uuid}\n"
             tag  = "lold_known"
@@ -641,7 +774,6 @@ class DriverScannerApp:
 
         txt_frame = tk.Frame(dlg, bg=BG, highlightthickness=1, highlightbackground=BORDER)
         txt_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-
         txt = tk.Text(txt_frame, bg=BG2, fg=TEXT, font=("Courier New", 9),
                       bd=0, relief="flat", wrap="none",
                       highlightthickness=0, insertbackground=ACCENT)
@@ -653,7 +785,6 @@ class DriverScannerApp:
         sb_x.grid(row=1, column=0, sticky="ew")
         txt_frame.grid_rowconfigure(0, weight=1)
         txt_frame.grid_columnconfigure(0, weight=1)
-
         txt.insert("1.0", yaml_str)
         txt.configure(state="disabled")
 
@@ -661,14 +792,12 @@ class DriverScannerApp:
         btn_row.pack(fill="x", padx=12, pady=(0, 12))
 
         def copy_yaml():
-            dlg.clipboard_clear()
-            dlg.clipboard_append(yaml_str)
+            dlg.clipboard_clear(); dlg.clipboard_append(yaml_str)
             self.status_var.set("YAML copied to clipboard.")
 
         def save_yaml():
             dest = filedialog.asksaveasfilename(
-                parent=dlg,
-                defaultextension=".yaml",
+                parent=dlg, defaultextension=".yaml",
                 initialfile=r["filename"].replace(".sys", ".yaml"),
                 filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")],
                 title="Save LOLDrivers YAML",
@@ -677,16 +806,16 @@ class DriverScannerApp:
                 Path(dest).write_text(yaml_str, encoding="utf-8")
                 self.status_var.set(f"YAML saved to {dest}")
 
-        self._btn(btn_row, "📋  COPY TO CLIPBOARD", copy_yaml, ACCENT).pack(side="left", padx=(0, 8))
-        self._btn(btn_row, "💾  SAVE TO FILE",      save_yaml,  GOLD  ).pack(side="left")
+        self._btn(btn_row, "📋  COPY TO CLIPBOARD", copy_yaml,   ACCENT ).pack(side="left", padx=(0, 8))
+        self._btn(btn_row, "💾  SAVE TO FILE",      save_yaml,   GOLD   ).pack(side="left")
         self._btn(btn_row, "✕  CLOSE",              dlg.destroy, ACCENT2).pack(side="right")
 
     def _build_yaml(self, r):
-        arch_map = {"x86": "x86", "x64": "AMD64", "ARM64": "ARM64"}
-        machine  = arch_map.get(r["architecture"], r["architecture"])
+        arch_map  = {"x86": "x86", "x64": "AMD64", "ARM64": "ARM64"}
+        machine   = arch_map.get(r["architecture"], r["architecture"])
         tags_yaml = "\n".join(f"  - {imp}" for imp in r["dangerous_imports"]) \
                     if r["dangerous_imports"] else '  - ""'
-        created  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        created   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
         return (
             f"Id: {uuid.uuid4()}\n"
             f"Author: \"\"\n"
@@ -727,7 +856,7 @@ class DriverScannerApp:
             f"{tags_yaml}\n"
         )
 
-    # ── Actions ────────────────────────────────────────────────────────────────
+    # ── CSV export ─────────────────────────────────────────────────────────────
 
     def _export_csv(self):
         if not self.all_results:
@@ -735,14 +864,13 @@ class DriverScannerApp:
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".csv", filetypes=[("CSV files", "*.csv")],
-            title="Save results as CSV"
+            title="Save results as CSV",
         )
         if not path:
             return
-        # Export only rows currently visible in the tree (respects active filters)
         visible_idxs = [int(iid[1:]) for iid in self.tree.get_children()]
-        fields = ["filename", "path", "size_bytes", "architecture", "signed",
-                  "compile_timestamp", "dangerous_imports", "device_names",
+        fields = ["filename", "source_archive", "path", "size_bytes", "architecture",
+                  "signed", "compile_timestamp", "dangerous_imports", "device_names",
                   "symlinks", "pdb_path", "company", "description",
                   "original_filename", "md5", "sha1", "sha256", "error"]
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -756,6 +884,14 @@ class DriverScannerApp:
                 w.writerow(row)
         messagebox.showinfo("Exported", f"Saved {len(visible_idxs)} result(s) to:\n{path}")
 
+    # ── Clear ──────────────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        for tmp in self._temp_dirs:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._temp_dirs = []
+        self.root.destroy()
+
     def _clear(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -768,6 +904,10 @@ class DriverScannerApp:
         self.summary_text.delete("1.0", "end")
         self.summary_text.configure(state="disabled")
         self.status_var.set("Ready. Drop a folder or click Browse.")
+        # Clean up temp dirs from archive extractions
+        for tmp in self._temp_dirs:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._temp_dirs = []
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
