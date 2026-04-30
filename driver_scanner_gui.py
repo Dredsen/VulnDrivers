@@ -238,9 +238,11 @@ class DriverScannerApp:
         self.root.geometry("1100x750")
         self.root.minsize(900, 600)
 
-        self.all_results  = []
-        self._temp_dirs   = []   # cleaned up on Clear or window close
-        self.scan_thread  = None
+        self.all_results     = []
+        self._temp_dirs      = []   # cleaned up on Clear or window close
+        self._elapsed_running = False
+        self._elapsed_start   = 0.0
+        self.scan_thread     = None
         self.signed_only    = tk.BooleanVar(value=False)
         self.dangerous_only = tk.BooleanVar(value=False)
 
@@ -286,8 +288,11 @@ class DriverScannerApp:
         status_bar.pack(fill="x")
         tk.Label(status_bar, textvariable=self.status_var, font=("Courier New", 9),
                  fg=TEXT_DIM, bg=BG2, anchor="w").pack(side="left", padx=14)
-        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=120)
+        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=200)
         self.progress.pack(side="right", padx=14)
+        self.elapsed_label = tk.Label(status_bar, text="", font=("Courier New", 9),
+                                      fg=GOLD, bg=BG2, width=6, anchor="e")
+        self.elapsed_label.pack(side="right")
 
     def _build_left(self, parent):
         drop_frame = tk.Frame(parent, bg=BG3, bd=0, highlightthickness=2,
@@ -441,6 +446,29 @@ class DriverScannerApp:
 
     # ── Events ─────────────────────────────────────────────────────────────────
 
+    # ── Elapsed time ticker ────────────────────────────────────────────────────
+
+    def _start_elapsed_ticker(self):
+        self._elapsed_running = True
+        self._elapsed_start   = time.time()
+        self._tick_elapsed()
+
+    def _stop_elapsed_ticker(self):
+        self._elapsed_running = False
+        self.elapsed_label.config(text="")
+
+    def _tick_elapsed(self):
+        if not self._elapsed_running:
+            return
+        secs = int(time.time() - self._elapsed_start)
+        if secs < 60:
+            self.elapsed_label.config(text=f"{secs}s")
+        else:
+            self.elapsed_label.config(text=f"{secs // 60}m{secs % 60:02d}s")
+        self.root.after(1000, self._tick_elapsed)
+
+    # ── Events ─────────────────────────────────────────────────────────────────
+
     def _browse(self):
         folder = filedialog.askdirectory(title="Select folder to scan")
         if folder:
@@ -575,6 +603,13 @@ class DriverScannerApp:
             if extract_base not in self._temp_dirs:
                 self._temp_dirs.append(extract_base)
 
+            n_arch = len(archives)
+            self.root.after(0, lambda: [
+                self.progress.stop(),
+                self.progress.config(mode="determinate", maximum=n_arch, value=0),
+                self._start_elapsed_ticker(),
+            ])
+
             def _extract_one(archive):
                 tmp = extract_base / archive.name
                 tmp.mkdir(parents=True, exist_ok=True)
@@ -585,16 +620,23 @@ class DriverScannerApp:
                 with extract_lock:
                     extract_done[0] += 1
                     d = extract_done[0]
-                self.root.after(0, lambda d=d, t=len(archives), n=archive.name:
+                self.root.after(0, lambda: self.progress.step(1))
+                self.root.after(0, lambda d=d, t=n_arch, n=archive.name:
                     self.status_var.set(f"Extracting {d}/{t}: {n}"))
                 return archive, sys_found, err
 
-            with ThreadPoolExecutor(max_workers=min(4, len(archives))) as pool:
+            with ThreadPoolExecutor(max_workers=min(4, n_arch)) as pool:
                 for archive, sys_found, err in pool.map(_extract_one, archives):
                     if err:
                         extract_errors.append((archive, err))
                     else:
                         extracted_pairs.extend((p, str(archive)) for p in sys_found)
+
+            self.root.after(0, lambda: [
+                self._stop_elapsed_ticker(),
+                self.progress.config(mode="indeterminate", value=0),
+                self.progress.start(12),
+            ])
 
         # ── Phase 2: analyse all drivers in parallel (max cpu_count workers) ──
         all_jobs = [(p, "") for p in sys_files] + extracted_pairs
@@ -645,6 +687,7 @@ class DriverScannerApp:
         self.root.after(0, lambda: self._finish_scan(len(sys_files), len(archives)))
 
     def _finish_scan(self, direct_count, archive_count):
+        self._stop_elapsed_ticker()
         self.progress.stop()
         results   = self.all_results
         signed    = sum(1 for r in results if r["signed"])
@@ -933,6 +976,7 @@ class DriverScannerApp:
     # ── Clear ──────────────────────────────────────────────────────────────────
 
     def _on_close(self):
+        self._stop_elapsed_ticker()
         for tmp in self._temp_dirs:
             shutil.rmtree(tmp, ignore_errors=True)
         self._temp_dirs = []
