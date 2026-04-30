@@ -72,7 +72,7 @@ DANGEROUS_IMPORTS = [
     "ZwLoadDriver", "ZwSystemDebugControl",
 ]
 
-ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar"}
+ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar", ".iso"}
 
 LOLDRIVERS_API_URL = "https://www.loldrivers.io/api/drivers.json"
 
@@ -133,7 +133,7 @@ def extract_archive(archive_path, dest_dir, seven_zip=None):
             result = subprocess.run(
                 [seven_zip, "x", str(archive_path), f"-o{dest_dir}",
                  "-y", "-r", "*.sys", "-mmt=on"],
-                capture_output=True, timeout=120,
+                capture_output=True, timeout=300,
             )
             if result.returncode not in (0, 1):
                 error = result.stderr.decode(errors="ignore").strip() or f"7z exit {result.returncode}"
