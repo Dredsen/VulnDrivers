@@ -22,6 +22,7 @@ import zipfile
 import threading
 import subprocess
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -523,78 +524,111 @@ class DriverScannerApp:
         self.scan_thread.start()
 
     def _scan_worker(self, folder):
-        root = Path(folder)
+        root         = Path(folder)
+        extract_base = root / "_drvscan_extracted"
 
-        # Collect direct .sys files (excluding anything inside our own temp dirs)
-        own_temp = {str(t) for t in self._temp_dirs}
-        sys_files = [
-            p for p in sorted(root.rglob("*.sys"))
-            if not any(str(p).startswith(t) for t in own_temp)
-        ]
+        # Exclude our own extraction folder from the direct .sys scan
+        own_extract  = str(extract_base)
+        sys_files    = sorted(
+            p for p in root.rglob("*.sys")
+            if not str(p).startswith(own_extract)
+        )
 
-        # Collect archive files
-        archives = []
-        for ext in ARCHIVE_EXTENSIONS:
-            archives.extend(root.rglob(f"*{ext}"))
-        archives = sorted(set(archives))
+        archives = sorted(set(
+            p for ext in ARCHIVE_EXTENSIONS
+            for p in root.rglob(f"*{ext}")
+        ))
 
         if not sys_files and not archives:
             self.root.after(0, lambda: self.status_var.set("No .sys files or archives found."))
             self.root.after(0, self.progress.stop)
             return
 
-        self.root.after(0, lambda: self.status_var.set(
-            f"Found {len(sys_files)} driver(s), {len(archives)} archive(s). Analysing…"))
-
-        # ── Direct .sys files ──────────────────────────────────────────────────
-        for i, path in enumerate(sys_files, 1):
-            r = analyze_driver(path)
-            idx = len(self.all_results)
-            self.all_results.append(r)
-            if self._passes_filter(r):
-                self.root.after(0, lambda r=r, idx=idx: self._add_row(r, idx))
-            self.root.after(0, lambda i=i, t=len(sys_files), name=path.name: self.status_var.set(
-                f"Driver {i}/{t}: {name}"))
-
-        # ── Archives ───────────────────────────────────────────────────────────
         seven_zip = find_7zip()
         if archives and not seven_zip:
             self.root.after(0, lambda: self.status_var.set(
                 "7-Zip not found — .exe/.msi/.7z/.rar skipped. .zip and .cab still work."))
 
-        for i, archive in enumerate(archives, 1):
-            self.root.after(0, lambda i=i, t=len(archives), name=archive.name: self.status_var.set(
-                f"Extracting archive {i}/{t}: {name}"))
+        self.root.after(0, lambda: self.status_var.set(
+            f"Found {len(sys_files)} driver(s), {len(archives)} archive(s)…"))
 
-            tmp = root / "_drvscan_extracted" / archive.name
-            tmp.mkdir(parents=True, exist_ok=True)
-            if tmp not in self._temp_dirs:
-                # Register the top-level extracted folder once for cleanup
-                extract_root = root / "_drvscan_extracted"
-                if extract_root not in self._temp_dirs:
-                    self._temp_dirs.append(extract_root)
+        # ── Phase 1: extract all archives in parallel (max 4 concurrent) ──────
+        extracted_pairs = []   # (Path, source_archive_str)
+        extract_errors  = []
+        extract_lock    = threading.Lock()
+        extract_done    = [0]
 
-            extracted_sys, err = extract_archive(archive, tmp, seven_zip)
+        if archives:
+            extract_base.mkdir(exist_ok=True)
+            if extract_base not in self._temp_dirs:
+                self._temp_dirs.append(extract_base)
 
-            if err:
-                # Store a sentinel result so the error is visible in the summary
-                self.all_results.append({
-                    "path": str(archive), "filename": archive.name,
-                    "size_bytes": 0, "md5": "", "sha1": "", "sha256": "",
-                    "signed": False, "compile_timestamp": "", "architecture": "",
-                    "dangerous_imports": [], "device_names": [], "symlinks": [],
-                    "pdb_path": "", "company": "", "description": "",
-                    "original_filename": "", "source_archive": "",
-                    "error": f"Extraction failed: {err}",
-                })
-                continue
+            def _extract_one(archive):
+                tmp = extract_base / archive.name
+                tmp.mkdir(parents=True, exist_ok=True)
+                try:
+                    sys_found, err = extract_archive(archive, tmp, seven_zip)
+                except Exception as e:
+                    sys_found, err = [], str(e)
+                with extract_lock:
+                    extract_done[0] += 1
+                    d = extract_done[0]
+                self.root.after(0, lambda d=d, t=len(archives), n=archive.name:
+                    self.status_var.set(f"Extracting {d}/{t}: {n}"))
+                return archive, sys_found, err
 
-            for path in extracted_sys:
-                r = analyze_driver(path, source_archive=str(archive))
+            with ThreadPoolExecutor(max_workers=min(4, len(archives))) as pool:
+                for archive, sys_found, err in pool.map(_extract_one, archives):
+                    if err:
+                        extract_errors.append((archive, err))
+                    else:
+                        extracted_pairs.extend((p, str(archive)) for p in sys_found)
+
+        # ── Phase 2: analyse all drivers in parallel (max cpu_count workers) ──
+        all_jobs = [(p, "") for p in sys_files] + extracted_pairs
+        total    = len(all_jobs)
+
+        results_lock  = threading.Lock()
+        analyse_done  = [0]
+
+        # Capture filter state once so background threads don't touch tkinter vars
+        signed_only   = self.signed_only.get()
+        dangerous_only = self.dangerous_only.get()
+
+        def _passes(r):
+            if signed_only   and not r["signed"]:           return False
+            if dangerous_only and not r["dangerous_imports"]: return False
+            return True
+
+        def _analyse_one(job):
+            path, src = job
+            r = analyze_driver(path, source_archive=src)
+            with results_lock:
                 idx = len(self.all_results)
                 self.all_results.append(r)
-                if self._passes_filter(r):
-                    self.root.after(0, lambda r=r, idx=idx: self._add_row(r, idx))
+                analyse_done[0] += 1
+                d = analyse_done[0]
+            self.root.after(0, lambda d=d, t=total:
+                self.status_var.set(f"Analysing {d}/{t} drivers…"))
+            if _passes(r):
+                self.root.after(0, lambda r=r, idx=idx: self._add_row(r, idx))
+
+        n_workers = min(os.cpu_count() or 4, 16)
+        if total:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                list(pool.map(_analyse_one, all_jobs))
+
+        # Append extraction-error sentinels (not shown in tree, visible in summary)
+        for archive, err in extract_errors:
+            self.all_results.append({
+                "path": str(archive), "filename": archive.name,
+                "size_bytes": 0, "md5": "", "sha1": "", "sha256": "",
+                "signed": False, "compile_timestamp": "", "architecture": "",
+                "dangerous_imports": [], "device_names": [], "symlinks": [],
+                "pdb_path": "", "company": "", "description": "",
+                "original_filename": "", "source_archive": "",
+                "error": f"Extraction failed: {err}",
+            })
 
         self.root.after(0, lambda: self._finish_scan(len(sys_files), len(archives)))
 
