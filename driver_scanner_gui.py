@@ -72,6 +72,35 @@ DANGEROUS_IMPORTS = [
     "ZwLoadDriver", "ZwSystemDebugControl",
 ]
 
+# Severity scores for dangerous imports (higher = more dangerous)
+IMPORT_SEVERITY = {
+    "ZwLoadDriver":                         10,
+    "MmMapIoSpace":                         10,
+    "MmMapIoSpaceEx":                       10,
+    "ZwSystemDebugControl":                  9,
+    "MmCopyMemory":                          9,
+    "MmGetPhysicalAddress":                  9,
+    "ZwMapViewOfSection":                    9,
+    "KeServiceDescriptorTable":              8,
+    "ObReferenceObjectByName":               7,
+    "HalTranslateBusAddress":                6,
+    "ZwOpenSection":                         6,
+    "HalGetBusDataByOffset":                 5,
+    "HalSetBusDataByOffset":                 5,
+    "MmAllocateContiguousMemory":            4,
+    "MmAllocateContiguousMemorySpecifyCache":4,
+    "WRITE_PORT_UCHAR":                      3,
+    "WRITE_PORT_USHORT":                     3,
+    "WRITE_PORT_ULONG":                      3,
+    "READ_PORT_UCHAR":                       2,
+    "READ_PORT_USHORT":                      2,
+    "READ_PORT_ULONG":                       2,
+}
+
+def _import_severity_score(imports):
+    """Return the max severity score across a list of import names."""
+    return max((IMPORT_SEVERITY.get(n, 1) for n in imports), default=0)
+
 ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar", ".iso"}
 
 LOLDRIVERS_API_URL = "https://www.loldrivers.io/api/drivers.json"
@@ -255,6 +284,7 @@ def analyze_driver(path, source_archive=""):
         pe.close()
     except Exception as e:
         r["error"] = str(e)
+    r["severity_score"] = _import_severity_score(r["dangerous_imports"])
     return r
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -390,14 +420,17 @@ class DriverScannerApp:
         style.configure("Vertical.TScrollbar", background=BG3, troughcolor=BG,
                         arrowcolor=TEXT_DIM, borderwidth=0)
 
+        self._sort_col      = None
+        self._sort_reverse  = False
+
         self.tree = ttk.Treeview(frame, columns=cols, show="headings",
                                  selectmode="browse", style="Treeview")
-        vsb = ttk.Scrollbar(frame, orient="vertical",   command=self.tree.yview, style="Vertical.TScrollbar")
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview, style="Vertical.TScrollbar")
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
+        self.tree.configure(yscrollcommand=vsb.set)
 
         for col, label, width in zip(cols, col_labels, col_widths):
-            self.tree.heading(col, text=label)
+            self.tree.heading(col, text=label,
+                              command=lambda c=col: self._sort_by_col(c))
             self.tree.column(col, width=width, minwidth=30, anchor="w")
 
         self.tree.tag_configure("high",    background="#1a1200", foreground=GOLD)
@@ -407,12 +440,15 @@ class DriverScannerApp:
 
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
         frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._on_right_click)
+
+        if DND_AVAILABLE:
+            self.tree.drag_source_register(1, DND_FILES)
+            self.tree.dnd_bind("<<DragInitCmd>>", self._on_drag_init)
 
         # Right-click context menu
         self.ctx_menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=TEXT,
@@ -503,6 +539,21 @@ class DriverScannerApp:
         if folder:
             self._start_scan(folder)
 
+    def _on_drag_init(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+        _, r = self._selected_result()
+        if r is None:
+            return ("refuse", DND_FILES, "")
+        src = Path(r["path"])
+        if not src.exists():
+            self.status_var.set(f"Cannot drag: file not found — {src.name}")
+            return ("refuse", DND_FILES, "")
+        # Wrap path in braces if it contains spaces (Windows DND_FILES convention)
+        path_str = f"{{{src}}}" if " " in str(src) else str(src)
+        return ("copy", DND_FILES, path_str)
+
     def _on_drop(self, event):
         path = event.data.strip().strip("{}")
         if os.path.isdir(path):
@@ -576,10 +627,55 @@ class DriverScannerApp:
     def _apply_filters(self, *_):
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for idx, r in enumerate(self.all_results):
-            if self._passes_filter(r):
-                self._add_row(r, idx)
+        rows = [(idx, r) for idx, r in enumerate(self.all_results) if self._passes_filter(r)]
+        if self._sort_col:
+            rows = self._sorted_rows(rows)
+        for idx, r in rows:
+            self._add_row(r, idx)
         self.count_label.config(text=f"{len(self.tree.get_children())} result(s)")
+
+    def _sorted_rows(self, rows):
+        col = self._sort_col
+        rev = self._sort_reverse
+        def key(pair):
+            _, r = pair
+            if col == "danger":
+                return r.get("severity_score", 0)
+            if col == "priority":
+                return (1 if (r["signed"] and r["dangerous_imports"]) else 0)
+            if col == "filename":
+                return r["filename"].lower()
+            if col == "arch":
+                return r["architecture"]
+            if col == "signed":
+                return r["sign_type"]
+            if col == "company":
+                return (r["company"] or "").lower()
+            if col == "compiled":
+                return r["compile_timestamp"]
+            if col == "sha256":
+                return r["sha256"]
+            return ""
+        return sorted(rows, key=key, reverse=rev)
+
+    def _sort_by_col(self, col):
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col     = col
+            self._sort_reverse = col in ("danger", "priority")
+        # Update heading arrows
+        arrow_up   = " ▲"
+        arrow_down = " ▼"
+        for c in ("priority", "filename", "arch", "signed", "danger", "company", "compiled", "sha256"):
+            label = dict(zip(
+                ("priority", "filename", "arch", "signed", "danger", "company", "compiled", "sha256"),
+                ("!", "Filename", "Arch", "Signed", "Dangerous Imports", "Company", "Compiled", "SHA256"),
+            ))[c]
+            if c == col:
+                label += arrow_down if self._sort_reverse else arrow_up
+            self.tree.heading(c, text=label)
+        self._apply_filters()
 
     # ── Scanning ───────────────────────────────────────────────────────────────
 
@@ -661,15 +757,20 @@ class DriverScannerApp:
                     else:
                         extracted_pairs.extend((p, str(archive)) for p in sys_found)
 
-            self.root.after(0, lambda: [
-                self._stop_elapsed_ticker(),
-                self.progress.config(mode="indeterminate", value=0),
-                self.progress.start(12),
-            ])
+            self.root.after(0, self._stop_elapsed_ticker)
 
-        # ── Phase 2: analyse all drivers in parallel (max cpu_count workers) ──
+        # ── Phase 2: analyse all drivers in parallel (max 4 workers) ──────────
+        # pefile is pure-Python CPU work; more than 4 threads increases GIL
+        # contention and starves the tkinter main loop, causing visible freezes.
         all_jobs = [(p, "") for p in sys_files] + extracted_pairs
         total    = len(all_jobs)
+
+        if total:
+            self.root.after(0, lambda: [
+                self.progress.stop(),
+                self.progress.config(mode="determinate", maximum=total, value=0),
+                self._start_elapsed_ticker(),
+            ])
 
         results_lock  = threading.Lock()
         analyse_done  = [0]
@@ -683,6 +784,8 @@ class DriverScannerApp:
             if dangerous_only and not r["dangerous_imports"]: return False
             return True
 
+        update_every = max(1, total // 100)  # status text at most every 1% of total
+
         def _analyse_one(job):
             path, src = job
             r = analyze_driver(path, source_archive=src)
@@ -691,12 +794,14 @@ class DriverScannerApp:
                 self.all_results.append(r)
                 analyse_done[0] += 1
                 d = analyse_done[0]
-            self.root.after(0, lambda d=d, t=total:
-                self.status_var.set(f"Analysing {d}/{t} drivers…"))
+            self.root.after(0, lambda: self.progress.step(1))
+            if d % update_every == 0 or d == total:
+                self.root.after(0, lambda d=d, t=total:
+                    self.status_var.set(f"Analysing {d}/{t} drivers…"))
             if _passes(r):
                 self.root.after(0, lambda r=r, idx=idx: self._add_row(r, idx))
 
-        n_workers = min(os.cpu_count() or 4, 16)
+        n_workers = min(os.cpu_count() or 4, 12)
         if total:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 list(pool.map(_analyse_one, all_jobs))
@@ -706,10 +811,11 @@ class DriverScannerApp:
             self.all_results.append({
                 "path": str(archive), "filename": archive.name,
                 "size_bytes": 0, "md5": "", "sha1": "", "sha256": "",
-                "signed": False, "compile_timestamp": "", "architecture": "",
+                "signed": False, "sign_type": "", "compile_timestamp": "", "architecture": "",
                 "dangerous_imports": [], "device_names": [], "symlinks": [],
                 "pdb_path": "", "company": "", "description": "",
                 "original_filename": "", "source_archive": "",
+                "severity_score": 0,
                 "error": f"Extraction failed: {err}",
             })
 
@@ -760,9 +866,11 @@ class DriverScannerApp:
         self.summary_text.configure(state="disabled")
 
     def _add_row(self, r, idx):
-        signed_str = {"embedded": "YES ✓", "catalog": "CAT ✓"}.get(r["sign_type"], "no")
-        danger_str = ", ".join(r["dangerous_imports"]) if r["dangerous_imports"] else "—"
-        priority   = "🎯" if (r["signed"] and r["dangerous_imports"]) else ""
+        signed_str  = {"embedded": "YES ✓", "catalog": "CAT ✓"}.get(r["sign_type"], "no")
+        sorted_imps = sorted(r["dangerous_imports"],
+                             key=lambda n: IMPORT_SEVERITY.get(n, 1), reverse=True)
+        danger_str  = ", ".join(sorted_imps) if sorted_imps else "—"
+        priority    = "🎯" if (r["signed"] and r["dangerous_imports"]) else ""
         # Small marker for archive-extracted drivers
         filename   = f"[A] {r['filename']}" if r.get("source_archive") else r["filename"]
 
@@ -804,7 +912,9 @@ class DriverScannerApp:
         kv("Signed", sign_display, "signed" if r["signed"] else "danger")
 
         if r["dangerous_imports"]:
-            kv("Dangerous Imports", ", ".join(r["dangerous_imports"]), "danger")
+            sorted_imps = sorted(r["dangerous_imports"],
+                                 key=lambda n: IMPORT_SEVERITY.get(n, 1), reverse=True)
+            kv("Dangerous Imports", ", ".join(sorted_imps), "danger")
         else:
             kv("Dangerous Imports", "None found")
 
