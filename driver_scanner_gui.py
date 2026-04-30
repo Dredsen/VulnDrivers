@@ -112,19 +112,19 @@ def extract_archive(archive_path, dest_dir, seven_zip=None):
     try:
         if suffix == ".zip":
             with zipfile.ZipFile(archive_path) as zf:
-                members = [m for m in zf.namelist() if m.lower().endswith(".sys")]
-                if not members:
+                members = [m for m in zf.namelist()
+                           if m.lower().endswith((".sys", ".cat"))]
+                if not any(m.lower().endswith(".sys") for m in members):
                     return [], ""
                 for member in members:
                     zf.extract(member, dest_dir)
 
         elif suffix == ".cab":
-            result = subprocess.run(
-                ["expand.exe", str(archive_path), "-F:*.sys", str(dest_dir)],
-                capture_output=True, timeout=60,
-            )
-            if result.returncode not in (0, 1):
-                error = result.stderr.decode(errors="ignore").strip() or f"expand exit {result.returncode}"
+            for pattern in ("*.sys", "*.cat"):
+                subprocess.run(
+                    ["expand.exe", str(archive_path), f"-F:{pattern}", str(dest_dir)],
+                    capture_output=True, timeout=60,
+                )
 
         elif seven_zip:
             # Quick listing pass — skip archive entirely if no .sys present
@@ -132,7 +132,7 @@ def extract_archive(archive_path, dest_dir, seven_zip=None):
                 return [], ""
             result = subprocess.run(
                 [seven_zip, "x", str(archive_path), f"-o{dest_dir}",
-                 "-y", "-r", "*.sys", "-mmt=on"],
+                 "-y", "-r", "*.sys", "*.cat", "-mmt=on"],
                 capture_output=True, timeout=300,
             )
             if result.returncode not in (0, 1):
@@ -191,7 +191,8 @@ def analyze_driver(path, source_archive=""):
         "path": str(path), "filename": path.name,
         "size_bytes": path.stat().st_size,
         "md5": "", "sha1": "", "sha256": "",
-        "signed": False, "compile_timestamp": "",
+        "signed": False, "sign_type": "",   # "embedded", "catalog", or ""
+        "compile_timestamp": "",
         "architecture": "", "dangerous_imports": [],
         "device_names": [], "symlinks": [],
         "pdb_path": "", "company": "", "description": "",
@@ -203,7 +204,12 @@ def analyze_driver(path, source_archive=""):
         with open(path, "rb") as f:
             raw = f.read()
         pe = pefile.PE(data=raw, fast_load=False)
-        r["signed"] = hasattr(pe, "DIRECTORY_ENTRY_SECURITY")
+        if hasattr(pe, "DIRECTORY_ENTRY_SECURITY"):
+            r["signed"]    = True
+            r["sign_type"] = "embedded"
+        elif any(path.parent.glob("*.cat")):
+            r["signed"]    = True
+            r["sign_type"] = "catalog"
         ts = pe.FILE_HEADER.TimeDateStamp
         try:
             r["compile_timestamp"] = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -713,7 +719,9 @@ class DriverScannerApp:
         self._stop_elapsed_ticker()
         self.progress.stop()
         results   = self.all_results
-        signed    = sum(1 for r in results if r["signed"])
+        embedded  = sum(1 for r in results if r.get("sign_type") == "embedded")
+        catalog   = sum(1 for r in results if r.get("sign_type") == "catalog")
+        signed    = embedded + catalog
         unsigned  = sum(1 for r in results if not r["signed"] and not r["error"])
         danger    = sum(1 for r in results if r["dangerous_imports"])
         high      = sum(1 for r in results if r["signed"] and r["dangerous_imports"])
@@ -723,7 +731,8 @@ class DriverScannerApp:
 
         self.status_var.set(
             f"Done — {shown} shown / {len(results)} scanned  |  "
-            f"Signed: {signed}  Dangerous: {danger}  🎯 Priority: {high}"
+            f"Signed: {signed} ({embedded} emb / {catalog} cat)  "
+            f"Dangerous: {danger}  🎯 Priority: {high}"
         )
         self.count_label.config(text=f"{shown} result(s)")
 
@@ -734,7 +743,8 @@ class DriverScannerApp:
             f"Total results  {len(results)}",
             f"Shown          {shown}",
             f"───────────────────────",
-            f"Signed         {signed}",
+            f"Embedded ✓     {embedded}",
+            f"Catalog  ✓     {catalog}",
             f"Unsigned       {unsigned}",
             f"───────────────────────",
             f"Dangerous      {danger}",
@@ -750,7 +760,7 @@ class DriverScannerApp:
         self.summary_text.configure(state="disabled")
 
     def _add_row(self, r, idx):
-        signed_str = "YES ✓" if r["signed"] else "no"
+        signed_str = {"embedded": "YES ✓", "catalog": "CAT ✓"}.get(r["sign_type"], "no")
         danger_str = ", ".join(r["dangerous_imports"]) if r["dangerous_imports"] else "—"
         priority   = "🎯" if (r["signed"] and r["dangerous_imports"]) else ""
         # Small marker for archive-extracted drivers
@@ -789,8 +799,9 @@ class DriverScannerApp:
         kv("Company",       r["company"] or "—")
         kv("Description",   r["description"] or "—")
         kv("Original Name", r["original_filename"] or "—")
-        kv("Signed",        "YES" if r["signed"] else "NO",
-           "signed" if r["signed"] else "danger")
+        sign_display = {"embedded": "YES — embedded Authenticode",
+                        "catalog":  "YES — catalog signed (.cat)"}.get(r["sign_type"], "NO")
+        kv("Signed", sign_display, "signed" if r["signed"] else "danger")
 
         if r["dangerous_imports"]:
             kv("Dangerous Imports", ", ".join(r["dangerous_imports"]), "danger")
