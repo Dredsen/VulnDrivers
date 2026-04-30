@@ -54,10 +54,13 @@ TEXT      = "#c8d0e0"
 TEXT_DIM  = "#5a6070"
 
 DANGEROUS_IMPORTS = [
-    # Physical memory access
+    # Physical memory — direct map
     "MmMapIoSpace", "MmMapIoSpaceEx",
     "MmGetPhysicalAddress", "MmCopyMemory",
     "MmAllocateContiguousMemory", "MmAllocateContiguousMemorySpecifyCache",
+    # Physical memory — MDL chain (IoAllocateMdl+MmProbeAndLockPages+MmMapLockedPages*)
+    "MmMapLockedPagesSpecifyCache", "MmMapLockedPages",
+    "IoAllocateMdl", "MmProbeAndLockPages", "MmBuildMdlForNonPagedPool",
     # Section/view mapping
     "ZwMapViewOfSection", "ZwOpenSection",
     # Bus / hardware access
@@ -66,40 +69,110 @@ DANGEROUS_IMPORTS = [
     "READ_PORT_UCHAR",  "WRITE_PORT_UCHAR",
     "READ_PORT_USHORT", "WRITE_PORT_USHORT",
     "READ_PORT_ULONG",  "WRITE_PORT_ULONG",
+    # Process / token manipulation
+    "ZwOpenProcess", "ZwTerminateProcess",
+    "PsLookupProcessByProcessId", "PsLookupThreadByThreadId",
+    "ZwAdjustPrivilegesToken", "SeTokenIsAdmin",
     # Kernel object / SSDT manipulation
     "ObReferenceObjectByName", "KeServiceDescriptorTable",
-    # Driver loading and debug control (highest severity)
+    # Object manager — resolve handles/names to EPROCESS
+    "ObReferenceObjectByHandle", "ObOpenObjectByPointer",
+    # Virtual memory — remote process read/write (LSASS dump, code injection)
+    "ZwWriteVirtualMemory", "ZwReadVirtualMemory",
+    "ZwAllocateVirtualMemory", "ZwProtectVirtualMemory",
+    "MmCopyVirtualMemory",
+    # Process context switching — access any address space without a handle
+    "KeAttachProcess", "KeStackAttachProcess",
+    # Section objects — shared memory for shellcode injection
+    "ZwCreateSection",
+    # Process enumeration — DKOM prerequisite
+    "PsGetNextProcess",
+    # Handle duplication — steal handles from other processes
+    "ZwDuplicateObject",
+    # Kernel module enumeration — used to find SSDT / ntoskrnl offsets
+    "ZwQuerySystemInformation",
+    # Driver loading and debug control
     "ZwLoadDriver", "ZwSystemDebugControl",
 ]
 
 # Severity scores for dangerous imports (higher = more dangerous)
 IMPORT_SEVERITY = {
-    "ZwLoadDriver":                         10,
-    "MmMapIoSpace":                         10,
-    "MmMapIoSpaceEx":                       10,
-    "ZwSystemDebugControl":                  9,
-    "MmCopyMemory":                          9,
-    "MmGetPhysicalAddress":                  9,
-    "ZwMapViewOfSection":                    9,
-    "KeServiceDescriptorTable":              8,
-    "ObReferenceObjectByName":               7,
-    "HalTranslateBusAddress":                6,
-    "ZwOpenSection":                         6,
-    "HalGetBusDataByOffset":                 5,
-    "HalSetBusDataByOffset":                 5,
-    "MmAllocateContiguousMemory":            4,
-    "MmAllocateContiguousMemorySpecifyCache":4,
-    "WRITE_PORT_UCHAR":                      3,
-    "WRITE_PORT_USHORT":                     3,
-    "WRITE_PORT_ULONG":                      3,
-    "READ_PORT_UCHAR":                       2,
-    "READ_PORT_USHORT":                      2,
-    "READ_PORT_ULONG":                       2,
+    # Tier 10 — arbitrary code execution / direct driver load
+    "ZwLoadDriver":                          10,
+    "ZwSystemDebugControl":                  10,
+    # Tier 9 — arbitrary physical memory read/write
+    "MmMapIoSpace":                           9,
+    "MmMapIoSpaceEx":                         9,
+    "MmCopyMemory":                           9,
+    "MmGetPhysicalAddress":                   9,
+    "MmMapLockedPagesSpecifyCache":           9,
+    "ZwMapViewOfSection":                     9,
+    # Tier 8 — token theft / privilege escalation / process memory write
+    "ZwOpenProcess":                          8,
+    "ZwAdjustPrivilegesToken":                8,
+    "MmMapLockedPages":                       8,
+    "KeServiceDescriptorTable":               8,
+    "ZwProtectVirtualMemory":                 8,  # make pages RWX (shellcode injection)
+    "KeAttachProcess":                        8,  # attach to any process address space
+    "KeStackAttachProcess":                   8,
+    # Tier 7 — process/thread control, EPROCESS access, section injection
+    "PsLookupProcessByProcessId":             7,
+    "PsLookupThreadByThreadId":               7,
+    "ZwTerminateProcess":                     7,
+    "ObReferenceObjectByName":                7,
+    "ZwWriteVirtualMemory":                   7,  # write to remote process memory
+    "ZwReadVirtualMemory":                    7,  # read from remote process (LSASS dump)
+    "ZwAllocateVirtualMemory":                7,  # allocate in remote process
+    "ZwCreateSection":                        7,  # shared memory for code injection
+    # Tier 6 — MDL chain components, bus access, object resolution
+    "HalTranslateBusAddress":                 6,
+    "ZwOpenSection":                          6,
+    "IoAllocateMdl":                          6,
+    "MmProbeAndLockPages":                    6,
+    "SeTokenIsAdmin":                         6,
+    "ObReferenceObjectByHandle":              6,  # EPROCESS from opened handle
+    "ObOpenObjectByPointer":                  6,
+    # Tier 5 — hardware read/write, supporting MDL, enumeration
+    "HalGetBusDataByOffset":                  5,
+    "HalSetBusDataByOffset":                  5,
+    "MmBuildMdlForNonPagedPool":              5,
+    "PsGetNextProcess":                       5,  # walk process list (DKOM)
+    "ZwDuplicateObject":                      5,  # steal handles from other processes
+    "ZwQuerySystemInformation":               5,  # enumerate kernel modules / SSDT offsets
+    "MmCopyVirtualMemory":                    5,  # kernel-internal process memory copy
+    # Tier 4 — contiguous memory alloc
+    "MmAllocateContiguousMemory":             4,
+    "MmAllocateContiguousMemorySpecifyCache": 4,
+    # Tier 3 — port I/O write
+    "WRITE_PORT_UCHAR":                       3,
+    "WRITE_PORT_USHORT":                      3,
+    "WRITE_PORT_ULONG":                       3,
+    # Tier 2 — port I/O read
+    "READ_PORT_UCHAR":                        2,
+    "READ_PORT_USHORT":                       2,
+    "READ_PORT_ULONG":                        2,
 }
 
 def _import_severity_score(imports):
     """Return the max severity score across a list of import names."""
     return max((IMPORT_SEVERITY.get(n, 1) for n in imports), default=0)
+
+# Imports that create a user-accessible kernel device — strong exploitability signal
+DEVICE_CREATION_IMPORTS = frozenset({
+    "IoCreateDevice", "IoCreateDeviceSecure", "WdmlibIoCreateDeviceSecure",
+    "IoCreateSymbolicLink",
+})
+
+# Framework entry points that indicate the driver has no direct IOCTL surface
+FRAMEWORK_IMPORTS = {
+    "StorPortInitialize":          "StorPort miniport",
+    "WdfDriverCreate":             "WDF driver",
+    "NdisMRegisterMiniportDriver": "NDIS miniport",
+    "NdisRegisterProtocolDriver":  "NDIS protocol",
+    "ClassInitialize":             "Storage class",
+    "VideoPortInitialize":         "Video miniport",
+    "SoundDriverEntry":            "Sound miniport",
+}
 
 ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar", ".iso"}
 
@@ -226,6 +299,13 @@ def analyze_driver(path, source_archive=""):
         "device_names": [], "symlinks": [],
         "pdb_path": "", "company": "", "description": "",
         "original_filename": "", "source_archive": source_archive,
+        "has_device_creation": False,  # imports IoCreateDevice/IoCreateSymbolicLink
+        "device_no_dacl": False,       # IoCreateDevice without IoCreateDeviceSecure (world-accessible)
+        "has_ioctl_dispatch": False,   # imports IoGetCurrentIrpStackLocation (handles IOCTLs directly)
+        "has_msr_access": False,       # RDMSR/WRMSR instructions found in binary
+        "has_mdl_chain": False,        # full MDL memory-access chain present
+        "has_vm_write_chain": False,   # process access + ZwWriteVirtualMemory/MmCopyVirtualMemory
+        "framework": "",               # e.g. "StorPort miniport" — no direct IOCTL surface
         "error": "",
     }
     try:
@@ -246,13 +326,35 @@ def analyze_driver(path, source_archive=""):
             r["compile_timestamp"] = f"0x{ts:08X}"
         r["architecture"] = {0x014C: "x86", 0x8664: "x64", 0xAA64: "ARM64"}.get(
             pe.FILE_HEADER.Machine, "Unknown")
+        all_imports = set()
         if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
             for lib in pe.DIRECTORY_ENTRY_IMPORT:
                 for imp in lib.imports:
                     if imp.name:
                         name = imp.name.decode(errors="ignore")
+                        all_imports.add(name)
                         if any(d.lower() == name.lower() for d in DANGEROUS_IMPORTS):
                             r["dangerous_imports"].append(name)
+                        if name in DEVICE_CREATION_IMPORTS:
+                            r["has_device_creation"] = True
+                        if name in FRAMEWORK_IMPORTS and not r["framework"]:
+                            r["framework"] = FRAMEWORK_IMPORTS[name]
+                        if name == "IoGetCurrentIrpStackLocation":
+                            r["has_ioctl_dispatch"] = True
+        # World-accessible device: IoCreateDevice without the secured variant
+        if r["has_device_creation"]:
+            secure = {"IoCreateDeviceSecure", "WdmlibIoCreateDeviceSecure"}
+            r["device_no_dacl"] = not bool(all_imports & secure)
+        # MDL chain: all three components present = arbitrary memory read/write
+        mdl_chain = {"IoAllocateMdl", "MmProbeAndLockPages", "MmMapLockedPagesSpecifyCache"}
+        r["has_mdl_chain"] = mdl_chain.issubset(all_imports)
+        # VM write chain: process access primitive + memory write = arbitrary process memory write
+        vm_writers   = {"ZwWriteVirtualMemory", "MmCopyVirtualMemory"}
+        proc_access  = {"ZwOpenProcess", "PsLookupProcessByProcessId",
+                        "KeAttachProcess", "KeStackAttachProcess"}
+        r["has_vm_write_chain"] = bool(vm_writers & all_imports) and bool(proc_access & all_imports)
+        # RDMSR (0F 32) / WRMSR (0F 30) — MSR access, IA32_LSTAR rewrite = instant kernel exec
+        r["has_msr_access"] = b'\x0f\x32' in raw or b'\x0f\x30' in raw
         if hasattr(pe, "FileInfo"):
             for fi in pe.FileInfo:
                 if not isinstance(fi, list): fi = [fi]
@@ -823,6 +925,7 @@ class DriverScannerApp:
                 "dangerous_imports": [], "device_names": [], "symlinks": [],
                 "pdb_path": "", "company": "", "description": "",
                 "original_filename": "", "source_archive": "",
+                "has_device_creation": False, "framework": "",
                 "severity_score": 0,
                 "error": f"Extraction failed: {err}",
             })
@@ -880,9 +983,25 @@ class DriverScannerApp:
         sorted_imps = sorted(r["dangerous_imports"],
                              key=lambda n: IMPORT_SEVERITY.get(n, 1), reverse=True)
         danger_str  = ", ".join(sorted_imps) if sorted_imps else "—"
-        priority    = "🎯" if (r["signed"] and r["dangerous_imports"]) else ""
-        # Small marker for archive-extracted drivers
-        filename   = f"[A] {r['filename']}" if r.get("source_archive") else r["filename"]
+
+        # Priority marker:
+        #   🎯★ = signed + world-accessible device (no DACL) + sev≥6 import or attack chain
+        #         ~90% of known LOLDrivers: any process can open the device and IOCTL in
+        #   🎯  = signed + dangerous imports but device has DACL, no device detected, or lower sev
+        #   ⚠   = signed + dangerous + known framework driver (no direct IOCTL surface)
+        signed_danger = r["signed"] and r["dangerous_imports"]
+        max_sev    = _import_severity_score(r["dangerous_imports"])
+        has_chains = r.get("has_mdl_chain") or r.get("has_vm_write_chain") or r.get("has_msr_access")
+        if signed_danger and r.get("device_no_dacl") and (has_chains or max_sev >= 6):
+            priority = "🎯★"
+        elif signed_danger and r.get("framework"):
+            priority = "⚠"
+        elif signed_danger:
+            priority = "🎯"
+        else:
+            priority = ""
+
+        filename = f"[A] {r['filename']}" if r.get("source_archive") else r["filename"]
 
         tag = "normal"
         if r["signed"] and r["dangerous_imports"]: tag = "high"
@@ -904,7 +1023,12 @@ class DriverScannerApp:
             self.detail_text.insert("end", f"{val}\n", tag)
 
         if r["signed"] and r["dangerous_imports"]:
-            self.detail_text.insert("end", "  🎯 HIGH PRIORITY — Signed + Dangerous Imports\n", "gold")
+            if r.get("has_device_creation"):
+                self.detail_text.insert("end", "  🎯★ HIGH PRIORITY — Signed + Dangerous Imports + Device Creation\n", "gold")
+            elif r.get("framework"):
+                self.detail_text.insert("end", f"  ⚠ FRAMEWORK DRIVER ({r['framework']}) — IOCTL surface unlikely\n", "gold")
+            else:
+                self.detail_text.insert("end", "  🎯 HIGH PRIORITY — Signed + Dangerous Imports\n", "gold")
 
         if r.get("source_archive"):
             self.detail_text.insert("end", f"  📦 Extracted from: {r['source_archive']}\n", "archive")
@@ -927,6 +1051,23 @@ class DriverScannerApp:
             kv("Dangerous Imports", ", ".join(sorted_imps), "danger")
         else:
             kv("Dangerous Imports", "None found")
+
+        if r.get("has_device_creation"):
+            dacl = "NO DACL — world-accessible" if r.get("device_no_dacl") else "IoCreateDeviceSecure (may restrict access)"
+            kv("Device Creation", f"YES — {dacl}", "signed" if not r.get("device_no_dacl") else "danger")
+        elif r.get("framework"):
+            kv("Driver Framework", r["framework"] + " — no direct IOCTL surface", "hash")
+        else:
+            kv("Device Creation", "Not detected in imports", "hash")
+
+        if r.get("has_ioctl_dispatch"):
+            kv("IOCTL Dispatch",  "YES — IoGetCurrentIrpStackLocation imported", "signed")
+        if r.get("has_mdl_chain"):
+            kv("MDL Chain",       "YES — IoAllocateMdl+MmProbeAndLock+MmMapLocked (phys r/w)", "danger")
+        if r.get("has_vm_write_chain"):
+            kv("VM Write Chain",  "YES — process access + ZwWriteVirtualMemory/MmCopyVirtualMemory", "danger")
+        if r.get("has_msr_access"):
+            kv("MSR Access",      "YES — RDMSR/WRMSR instructions (IA32_LSTAR writable?)", "danger")
 
         kv("Device Names", ", ".join(r["device_names"]) or "—")
         kv("Symlinks",     ", ".join(r["symlinks"]) or "—")
