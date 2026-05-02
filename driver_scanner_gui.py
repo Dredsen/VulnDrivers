@@ -172,6 +172,16 @@ FRAMEWORK_IMPORTS = {
     "ClassInitialize":             "Storage class",
     "VideoPortInitialize":         "Video miniport",
     "SoundDriverEntry":            "Sound miniport",
+    # Kernel Streaming — audio/media filters; MDL use is for DMA buffers, not arbitrary memory
+    "KsCreatePin":                 "KS audio/media filter",
+    "KsInitializeDriver":          "KS audio/media filter",
+    "KsDispatchIrp":               "KS audio/media filter",
+    "KsCreateFilterFactory":       "KS audio/media filter",
+    "PcInitializeAdapterDriver":   "PortCls audio miniport",
+    "PcAddAdapterDevice":          "PortCls audio miniport",
+    # PnP filter driver — attaches to existing device stack; device object has no name,
+    # is NOT accessible via CreateFile and therefore not directly exploitable from userspace
+    "IoAttachDeviceToDeviceStack": "PnP filter driver",
 }
 
 ARCHIVE_EXTENSIONS = {".zip", ".cab", ".exe", ".msi", ".7z", ".rar", ".iso"}
@@ -305,6 +315,7 @@ def analyze_driver(path, source_archive=""):
         "has_msr_access": False,       # RDMSR/WRMSR instructions found in binary
         "has_mdl_chain": False,        # full MDL memory-access chain present
         "has_vm_write_chain": False,   # process access + ZwWriteVirtualMemory/MmCopyVirtualMemory
+        "has_rw_primitive": False,     # confirmed r/w/x primitive (physical map, virtual r/w, MSR write)
         "framework": "",               # e.g. "StorPort miniport" — no direct IOCTL surface
         "error": "",
     }
@@ -341,10 +352,17 @@ def analyze_driver(path, source_archive=""):
                             r["framework"] = FRAMEWORK_IMPORTS[name]
                         if name == "IoGetCurrentIrpStackLocation":
                             r["has_ioctl_dispatch"] = True
-        # World-accessible device: IoCreateDevice without the secured variant
+        # World-accessible device: IoCreateDevice with no DACL applied
+        # False-positive guards:
+        #   1. Driver imports IoCreateDeviceSecure / WdmlibIoCreateDeviceSecure (secure creation)
+        #   2. Driver manually constructs a DACL: RtlSetDaclSecurityDescriptor + ZwSetSecurityObject
+        #      (pattern used by drivers that call raw IoCreateDevice then apply SD themselves)
         if r["has_device_creation"]:
-            secure = {"IoCreateDeviceSecure", "WdmlibIoCreateDeviceSecure"}
-            r["device_no_dacl"] = not bool(all_imports & secure)
+            secure_creation = {"IoCreateDeviceSecure", "WdmlibIoCreateDeviceSecure"}
+            manual_dacl     = {"RtlSetDaclSecurityDescriptor", "ZwSetSecurityObject"}
+            has_dacl = bool(all_imports & secure_creation) or \
+                       (manual_dacl.issubset(all_imports))
+            r["device_no_dacl"] = not has_dacl
         # MDL chain: all three components present = arbitrary memory read/write
         mdl_chain = {"IoAllocateMdl", "MmProbeAndLockPages", "MmMapLockedPagesSpecifyCache"}
         r["has_mdl_chain"] = mdl_chain.issubset(all_imports)
@@ -355,6 +373,16 @@ def analyze_driver(path, source_archive=""):
         r["has_vm_write_chain"] = bool(vm_writers & all_imports) and bool(proc_access & all_imports)
         # RDMSR (0F 32) / WRMSR (0F 30) — MSR access, IA32_LSTAR rewrite = instant kernel exec
         r["has_msr_access"] = b'\x0f\x32' in raw or b'\x0f\x30' in raw
+        # R/W/X primitive: any one of these is sufficient for memory exploitation
+        _phys_rw   = {"MmMapIoSpace", "MmMapIoSpaceEx", "MmCopyMemory"}
+        _virt_rw   = {"MmCopyVirtualMemory", "ZwWriteVirtualMemory", "ZwReadVirtualMemory",
+                      "KeAttachProcess", "KeStackAttachProcess"}
+        r["has_rw_primitive"] = (
+            bool(all_imports & _phys_rw) or   # direct physical memory map
+            r["has_mdl_chain"] or              # MDL chain = physical/virtual r/w
+            bool(all_imports & _virt_rw) or   # cross-process virtual memory r/w
+            b'\x0f\x30' in raw                # WRMSR = kernel exec via IA32_LSTAR
+        )
         if hasattr(pe, "FileInfo"):
             for fi in pe.FileInfo:
                 if not isinstance(fi, list): fi = [fi]
@@ -387,6 +415,12 @@ def analyze_driver(path, source_archive=""):
     except Exception as e:
         r["error"] = str(e)
     r["severity_score"] = _import_severity_score(r["dangerous_imports"])
+    # Priority score — single source of truth used by both display and sort
+    sd = r["signed"] and bool(r["dangerous_imports"])
+    if   sd and r.get("framework"):                                     r["priority_score"] = 1  # ⚠
+    elif sd and r.get("device_no_dacl") and r.get("has_rw_primitive"):  r["priority_score"] = 3  # 🎯★
+    elif sd:                                                             r["priority_score"] = 2  # 🎯
+    else:                                                                r["priority_score"] = 0
     return r
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -404,8 +438,11 @@ class DriverScannerApp:
         self._elapsed_running = False
         self._elapsed_start   = 0.0
         self.scan_thread     = None
-        self.signed_only    = tk.BooleanVar(value=False)
-        self.dangerous_only = tk.BooleanVar(value=False)
+        self.signed_only      = tk.BooleanVar(value=False)
+        self.dangerous_only   = tk.BooleanVar(value=False)
+        self.rw_only          = tk.BooleanVar(value=False)
+        self.hide_framework   = tk.BooleanVar(value=True)
+        self.x64_only         = tk.BooleanVar(value=True)
 
         self._lold_cache    = None
         self._lold_cache_ts = 0.0
@@ -414,6 +451,9 @@ class DriverScannerApp:
 
         self.signed_only.trace_add("write", self._apply_filters)
         self.dangerous_only.trace_add("write", self._apply_filters)
+        self.rw_only.trace_add("write", self._apply_filters)
+        self.hide_framework.trace_add("write", self._apply_filters)
+        self.x64_only.trace_add("write", self._apply_filters)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if DND_AVAILABLE:
@@ -478,6 +518,9 @@ class DriverScannerApp:
         filt.pack(fill="x", pady=(4, 12))
         self._check(filt, "Signed only  (recommended)", self.signed_only)
         self._check(filt, "Dangerous imports only", self.dangerous_only)
+        self._check(filt, "R/W primitive only", self.rw_only)
+        self._check(filt, "Hide framework drivers", self.hide_framework)
+        self._check(filt, "x64 only",               self.x64_only)
 
         self._btn(parent, "💾  EXPORT CSV",       self._export_csv,       GOLD   ).pack(fill="x", pady=(0, 8))
         self._btn(parent, "📋  EXPORT YAML",      self._export_yaml,      ACCENT ).pack(fill="x", pady=(0, 8))
@@ -719,10 +762,11 @@ class DriverScannerApp:
     # ── Filtering ──────────────────────────────────────────────────────────────
 
     def _passes_filter(self, r):
-        if self.signed_only.get() and not r["signed"]:
-            return False
-        if self.dangerous_only.get() and not r["dangerous_imports"]:
-            return False
+        if self.signed_only.get()    and not r["signed"]:             return False
+        if self.dangerous_only.get() and not r["dangerous_imports"]:  return False
+        if self.rw_only.get()        and not r.get("has_rw_primitive"):return False
+        if self.hide_framework.get() and r.get("framework"):           return False
+        if self.x64_only.get()      and r.get("architecture") != "x64": return False
         return True
 
     def _apply_filters(self, *_):
@@ -743,7 +787,7 @@ class DriverScannerApp:
             if col == "danger":
                 return r.get("severity_score", 0)
             if col == "priority":
-                return (1 if (r["signed"] and r["dangerous_imports"]) else 0)
+                return r.get("priority_score", 0)
             if col == "filename":
                 return r["filename"].lower()
             if col == "arch":
@@ -760,11 +804,16 @@ class DriverScannerApp:
         return sorted(rows, key=key, reverse=rev)
 
     def _sort_by_col(self, col):
-        if self._sort_col == col:
+        if col in ("priority", "danger"):
+            # These columns only make sense sorted highest-first; clicking again
+            # has no useful ascending counterpart so we just re-apply descending.
+            self._sort_col     = col
+            self._sort_reverse = True
+        elif self._sort_col == col:
             self._sort_reverse = not self._sort_reverse
         else:
             self._sort_col     = col
-            self._sort_reverse = col in ("danger", "priority")
+            self._sort_reverse = False
         # Update heading arrows
         arrow_up   = " ▲"
         arrow_down = " ▼"
@@ -879,12 +928,18 @@ class DriverScannerApp:
         dedup_count   = [0]
 
         # Capture filter state once so background threads don't touch tkinter vars
-        signed_only   = self.signed_only.get()
-        dangerous_only = self.dangerous_only.get()
+        signed_only     = self.signed_only.get()
+        dangerous_only  = self.dangerous_only.get()
+        rw_only         = self.rw_only.get()
+        hide_framework  = self.hide_framework.get()
+        x64_only        = self.x64_only.get()
 
         def _passes(r):
-            if signed_only   and not r["signed"]:           return False
-            if dangerous_only and not r["dangerous_imports"]: return False
+            if signed_only     and not r["signed"]:                       return False
+            if dangerous_only  and not r["dangerous_imports"]:            return False
+            if rw_only         and not r.get("has_rw_primitive"):         return False
+            if hide_framework  and r.get("framework"):                    return False
+            if x64_only        and r.get("architecture") != "x64":       return False
             return True
 
         update_every = max(1, total // 100)  # status text at most every 1% of total
@@ -942,6 +997,7 @@ class DriverScannerApp:
         unsigned  = sum(1 for r in results if not r["signed"] and not r["error"])
         danger    = sum(1 for r in results if r["dangerous_imports"])
         high      = sum(1 for r in results if r["signed"] and r["dangerous_imports"])
+        rw_count  = sum(1 for r in results if r.get("has_rw_primitive"))
         from_arch = sum(1 for r in results if r.get("source_archive"))
         errors    = sum(1 for r in results if r["error"])
         shown     = len(self.tree.get_children())
@@ -967,6 +1023,7 @@ class DriverScannerApp:
             f"Unsigned       {unsigned}",
             f"───────────────────────",
             f"Dangerous      {danger}",
+            f"R/W Primitive  {rw_count}",
             f"───────────────────────",
             f"🎯 Priority    {high}",
         ]
@@ -985,17 +1042,17 @@ class DriverScannerApp:
         danger_str  = ", ".join(sorted_imps) if sorted_imps else "—"
 
         # Priority marker:
-        #   🎯★ = signed + world-accessible device (no DACL) + sev≥6 import or attack chain
-        #         ~90% of known LOLDrivers: any process can open the device and IOCTL in
-        #   🎯  = signed + dangerous imports but device has DACL, no device detected, or lower sev
+        #   🎯★ = signed + world-accessible device (no DACL) + confirmed r/w/x primitive
+        #         Requires an actual memory primitive, not just a process-access helper
+        #   🎯  = signed + dangerous imports but no confirmed r/w primitive, no open device, or framework
         #   ⚠   = signed + dangerous + known framework driver (no direct IOCTL surface)
+        #         Framework check is first — PnP filters / miniports are not exploitable even
+        #         when IoCreateDevice has no DACL (unnamed filter devices have no namespace entry)
         signed_danger = r["signed"] and r["dangerous_imports"]
-        max_sev    = _import_severity_score(r["dangerous_imports"])
-        has_chains = r.get("has_mdl_chain") or r.get("has_vm_write_chain") or r.get("has_msr_access")
-        if signed_danger and r.get("device_no_dacl") and (has_chains or max_sev >= 6):
-            priority = "🎯★"
-        elif signed_danger and r.get("framework"):
+        if signed_danger and r.get("framework"):
             priority = "⚠"
+        elif signed_danger and r.get("device_no_dacl") and r.get("has_rw_primitive"):
+            priority = "🎯★"
         elif signed_danger:
             priority = "🎯"
         else:
@@ -1023,10 +1080,10 @@ class DriverScannerApp:
             self.detail_text.insert("end", f"{val}\n", tag)
 
         if r["signed"] and r["dangerous_imports"]:
-            if r.get("has_device_creation"):
-                self.detail_text.insert("end", "  🎯★ HIGH PRIORITY — Signed + Dangerous Imports + Device Creation\n", "gold")
-            elif r.get("framework"):
+            if r.get("framework"):
                 self.detail_text.insert("end", f"  ⚠ FRAMEWORK DRIVER ({r['framework']}) — IOCTL surface unlikely\n", "gold")
+            elif r.get("device_no_dacl") and r.get("has_rw_primitive"):
+                self.detail_text.insert("end", "  🎯★ HIGH PRIORITY — Signed + World-Accessible Device + R/W Primitive\n", "gold")
             else:
                 self.detail_text.insert("end", "  🎯 HIGH PRIORITY — Signed + Dangerous Imports\n", "gold")
 
@@ -1062,6 +1119,19 @@ class DriverScannerApp:
 
         if r.get("has_ioctl_dispatch"):
             kv("IOCTL Dispatch",  "YES — IoGetCurrentIrpStackLocation imported", "signed")
+        if r.get("has_rw_primitive"):
+            parts = []
+            if any(i in r["dangerous_imports"] for i in ("MmMapIoSpace","MmMapIoSpaceEx","MmCopyMemory")):
+                parts.append("physical map")
+            if r.get("has_mdl_chain"):
+                parts.append("MDL chain")
+            if any(i in r["dangerous_imports"] for i in
+                   ("MmCopyVirtualMemory","ZwWriteVirtualMemory","ZwReadVirtualMemory",
+                    "KeAttachProcess","KeStackAttachProcess")):
+                parts.append("virtual r/w")
+            if r.get("has_msr_access") and b'\x0f\x30' in (open(r["path"],"rb").read() if r.get("path") else b''):
+                parts.append("WRMSR")
+            kv("R/W Primitive",   f"YES — {', '.join(parts) if parts else 'detected'}", "danger")
         if r.get("has_mdl_chain"):
             kv("MDL Chain",       "YES — IoAllocateMdl+MmProbeAndLock+MmMapLocked (phys r/w)", "danger")
         if r.get("has_vm_write_chain"):
